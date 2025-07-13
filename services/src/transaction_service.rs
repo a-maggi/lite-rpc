@@ -20,8 +20,7 @@ use solana_lite_rpc_core::{
     AnyhowJoinHandle,
 };
 use solana_sdk::{
-    compute_budget::{self, ComputeBudgetInstruction},
-    transaction::VersionedTransaction,
+    commitment_config::CommitmentConfig, compute_budget::{self, ComputeBudgetInstruction}, transaction::VersionedTransaction
 };
 use tokio::{
     sync::mpsc::{self, Sender, UnboundedSender},
@@ -142,19 +141,26 @@ impl TransactionService {
         };
         let signature = tx.signatures[0];
 
-        let Some(BlockInformation {
-            slot,
-            last_valid_blockheight,
-            ..
-        }) = self
-            .block_information_store
-            .get_block_info(tx.get_recent_blockhash())
-        else {
-            bail!("Blockhash not found in block store".to_string());
-        };
+        let mut last_blockheight = self.block_information_store.get_last_blockheight();
+        let last_block_info = self.block_information_store.get_latest_block_information(CommitmentConfig::finalized()).await;
+        let mut slot_block = last_block_info.slot;
+        if !tx.uses_durable_nonce() {
+            let Some(BlockInformation {
+                slot,
+                last_valid_blockheight,
+                ..
+            }) = self
+                .block_information_store
+                .get_block_info(tx.get_recent_blockhash())
+            else {
+                bail!("Blockhash not found in block store".to_string());
+            };
 
-        if self.block_information_store.get_last_blockheight() > last_valid_blockheight {
-            bail!("Blockhash is expired");
+            if last_blockheight > last_valid_blockheight {
+                bail!("Blockhash is expired");
+            }
+            last_blockheight = last_valid_blockheight;
+            slot_block = slot;
         }
 
         let prioritization_fee = {
@@ -180,8 +186,8 @@ impl TransactionService {
         let max_replay = max_retries.map_or(self.max_retries, |x| x as usize);
         let transaction_info = SentTransactionInfo {
             signature,
-            last_valid_block_height: last_valid_blockheight,
-            slot,
+            last_valid_block_height: last_blockheight,
+            slot: slot_block,
             transaction: Arc::new(raw_tx),
             prioritization_fee,
         };
