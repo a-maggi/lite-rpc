@@ -25,4 +25,5 @@ COPY --from=build /app/target/release/lite-rpc /usr/local/bin/
 COPY openssl-legacy.cnf /etc/ssl/openssl-legacy.cnf
 
 ENV OPENSSL_CONF=/etc/ssl/openssl-legacy.cnf
+ENV RUST_LOG=info
 CMD lite-rpc
