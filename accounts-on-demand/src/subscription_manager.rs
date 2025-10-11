@@ -32,6 +32,21 @@ pub struct SubscriptionManger {
 }
 
 impl SubscriptionManger {
+    /// Creates a new subscription manager for accounts-on-demand.
+    /// 
+    /// ## Design: Lazy Subscription Initialization
+    /// 
+    /// The subscription starts with **empty filters** and the streaming task **waits** 
+    /// for the first non-empty filter update. This is intentional:
+    /// 
+    /// 1. System starts with no subscriptions (saves resources)
+    /// 2. When a user requests an account via RPC, `AccountsOnDemand.get_account()` is called
+    /// 3. This triggers `refresh_subscription()` → `update_subscriptions()` 
+    /// 4. The watch channel is updated with new filters
+    /// 5. The waiting streaming task receives the update and starts subscribing
+    /// 
+    /// This lazy initialization prevents the gRPC error "Broadcast `any` is not allowed"
+    /// while still allowing dynamic subscription updates as accounts are requested.
     pub fn new(
         grpc_sources: Vec<GrpcSourceConfig>,
         accounts_storage: Arc<dyn AccountStorageInterface>,
@@ -78,6 +93,16 @@ impl SubscriptionManger {
     }
 }
 
+/// Creates gRPC account streaming tasks that wait for filter updates.
+/// 
+/// This function is designed for accounts-on-demand where filters are added dynamically.
+/// The streaming task will wait (without consuming resources) until filters are provided
+/// via the watch channel. This prevents starting subscriptions with empty filters.
+/// 
+/// Filters are added when:
+/// - `AccountsOnDemand.get_account()` is called (user RPC request)
+/// - `AccountsOnDemand.get_program_accounts()` is called  
+/// - These call `refresh_subscription()` which updates the watch channel
 pub fn create_grpc_account_streaming_tasks(
     grpc_sources: Vec<GrpcSourceConfig>,
     mut account_filter_watch: watch::Receiver<AccountFilters>,
@@ -85,15 +110,30 @@ pub fn create_grpc_account_streaming_tasks(
     let (account_sender, accounts_stream) = broadcast::channel::<AccountNotificationMessage>(128);
 
     let jh: AnyhowJoinHandle = tokio::spawn(async move {
-        match account_filter_watch.changed().await {
-            Ok(_) => {
-                // do nothing
-            }
-            Err(e) => {
-                log::error!("account filter watch failed with error {}", e);
-                anyhow::bail!("Accounts on demand task failed");
+        // Wait for the first update with non-empty filters.
+        // This is a BLOCKING wait that doesn't consume resources until filters arrive.
+        // 
+        // Note: .changed() returns immediately with the initial value (empty vec),
+        // so we loop until we get actual valid filters before starting subscriptions.
+        // 
+        // Filters will be sent via the watch channel when users make RPC requests.
+        loop {
+            match account_filter_watch.changed().await {
+                Ok(_) => {
+                    let filters = account_filter_watch.borrow_and_update().clone();
+                    if !filters.is_empty() {
+                        log::info!("Accounts on demand received initial filters, starting subscription");
+                        break;
+                    }
+                    log::debug!("Accounts on demand waiting for valid filters...");
+                }
+                Err(e) => {
+                    log::error!("account filter watch failed with error {}", e);
+                    anyhow::bail!("Accounts on demand task failed");
+                }
             }
         }
+
         let accounts_filters = account_filter_watch.borrow_and_update().clone();
 
         let has_started = Arc::new(tokio::sync::Notify::new());
@@ -115,6 +155,12 @@ pub fn create_grpc_account_streaming_tasks(
             // wait for a second to get all the accounts to update
             tokio::time::sleep(Duration::from_secs(1)).await;
             let accounts_filters = account_filter_watch.borrow_and_update().clone();
+
+            // Skip restart if filters become empty (no accounts to monitor)
+            if accounts_filters.is_empty() {
+                log::debug!("Accounts on demand filters became empty, keeping previous subscription");
+                continue;
+            }
 
             let has_started = Arc::new(tokio::sync::Notify::new());
 

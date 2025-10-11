@@ -31,6 +31,22 @@ use yellowstone_grpc_proto::geyser::{
 use yellowstone_grpc_proto::tonic::codec::CompressionEncoding;
 use yellowstone_grpc_proto::tonic::service::Interceptor;
 
+/// Starts gRPC account streaming tasks for the given filters.
+///
+/// ## Important: AccountFilters Requirements
+/// 
+/// Each `AccountFilter` in the `accounts_filters` list must have **at least one** of:
+/// - A non-empty `accounts` list (specific account pubkeys to monitor)
+/// - A `program_id` (to monitor all accounts owned by that program)
+///
+/// If a filter has both empty `accounts` and no `program_id`, it will be skipped with a warning.
+/// If all filters are invalid, the function will retry after a delay.
+///
+/// This prevents the gRPC error: "Broadcast `any` is not allowed, at least one filter required"
+/// which occurs when the Yellowstone gRPC server receives an empty subscription request.
+///
+/// ## See Also
+/// - GitHub Issue: https://github.com/blockworks-foundation/lite-rpc/issues/398
 pub fn start_account_streaming_tasks(
     grpc_config: GrpcSourceConfig,
     accounts_filters: AccountFilters,
@@ -47,6 +63,18 @@ pub fn start_account_streaming_tasks(
             let mut accounts_to_subscribe = HashSet::new();
 
             for (index, accounts_filter) in accounts_filters.iter().enumerate() {
+                // Validate that this filter has at least one subscription target
+                let has_accounts = !accounts_filter.accounts.is_empty();
+                let has_program_id = accounts_filter.program_id.is_some();
+                
+                if !has_accounts && !has_program_id {
+                    log::warn!(
+                        "Skipping invalid account filter at index {}: must have either non-empty accounts list or a program_id",
+                        index
+                    );
+                    continue;
+                }
+
                 if !accounts_filter.accounts.is_empty() {
                     accounts_filter.accounts.iter().for_each(|account| {
                         accounts_to_subscribe.insert(account.clone());
@@ -104,19 +132,34 @@ pub fn start_account_streaming_tasks(
                 }
             }
 
-            let program_subscription = SubscribeRequest {
-                accounts: subscribe_programs,
-                accounts_data_slice: Default::default(),
-                commitment: Some(processed_commitment.into()),
-                ..Default::default()
-            };
-
-            let mut client = create_connection(&grpc_config).await?;
-
-            let account_stream = client.subscribe_once(program_subscription).await.unwrap();
+            // Validate that we have at least something to subscribe to
+            // This prevents the gRPC error: "Broadcast `any` is not allowed, at least one filter required"
+            if subscribe_programs.is_empty() && accounts_to_subscribe.is_empty() {
+                log::warn!(
+                    "No valid account filters for gRPC subscription on {}. Each filter must have either a program_id or non-empty accounts list. Waiting for valid filters...",
+                    grpc_config.grpc_addr
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue 'main_loop;
+            }
 
             // each account subscription batch will require individual stream
-            let mut subscriptions = vec![account_stream];
+            let mut subscriptions = vec![];
+
+            // Only subscribe to program filters if there are any
+            if !subscribe_programs.is_empty() {
+                let program_subscription = SubscribeRequest {
+                    accounts: subscribe_programs,
+                    accounts_data_slice: Default::default(),
+                    commitment: Some(processed_commitment.into()),
+                    ..Default::default()
+                };
+
+                let mut client = create_connection(&grpc_config).await?;
+                let account_stream = client.subscribe_once(program_subscription).await.unwrap();
+                subscriptions.push(account_stream);
+            }
+
             let mut index = 0;
             for accounts_chunk in accounts_to_subscribe.iter().collect_vec().chunks(100) {
                 let mut accounts_subscription: HashMap<String, SubscribeRequestFilterAccounts> =
@@ -146,6 +189,7 @@ pub fn start_account_streaming_tasks(
                 let account_stream = client.subscribe_once(account_request).await.unwrap();
                 subscriptions.push(account_stream);
             }
+
             let mut merged_stream = subscriptions.merge();
 
             while let Some(message) = merged_stream.next().await {
